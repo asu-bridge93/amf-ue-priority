@@ -483,36 +483,7 @@ func HandleRegistrationRequest(ue *context.AmfUe, anType models.AccessType, proc
 		}
 		ue.GmmLog.Infof("MobileIdentity5GS: SUCI[%s]", ue.Suci)
 
-		// Priority Control Logic
-		if config := factory.AmfConfig.Configuration.PriorityUE; config != nil {
-			initPriorityControl.Do(func() {
-				if config.MaxConcurrency > 0 {
-					nonPrioritySemaphore = make(chan struct{}, config.MaxConcurrency)
-				}
-				if config.IMSIPattern != "" {
-					var err error
-					priorityRegex, err = regexp.Compile(config.IMSIPattern)
-					if err != nil {
-						logger.GmmLog.Errorf("Invalid PriorityUE IMSI Pattern: %v", err)
-					}
-				}
-			})
 
-			isPriority := false
-			if priorityRegex != nil {
-				isPriority = priorityRegex.MatchString(ue.Suci)
-			}
-
-			if isPriority {
-				ue.GmmLog.Infof("Priority UE detected: %s", ue.Suci)
-			} else {
-				if nonPrioritySemaphore != nil {
-					ue.GmmLog.Infof("Non-priority UE buffered: %s", ue.Suci)
-					nonPrioritySemaphore <- struct{}{}
-					defer func() { <-nonPrioritySemaphore }()
-				}
-			}
-		}
 	case nasMessage.MobileIdentity5GSType5gGuti:
 		guamiFromUeGutiTmp, guti, err := nasConvert.GutiToStringWithError(mobileIdentity5GSContents)
 		if err != nil {
@@ -552,6 +523,48 @@ func HandleRegistrationRequest(ue *context.AmfUe, anType models.AccessType, proc
 		}
 		ue.Pei = imeisv
 		ue.GmmLog.Infof("MobileIdentity5GS: PEI[%s]", imeisv)
+	}
+
+
+	// Priority Control Logic (Moved outside of switch to support both SUCI and GUTI)
+	targetID := ue.Supi
+	if targetID == "" {
+		targetID = ue.Suci
+	}
+
+	if config := factory.AmfConfig.Configuration.PriorityUE; config != nil && targetID != "" {
+		initPriorityControl.Do(func() {
+			if config.MaxConcurrency > 0 {
+				nonPrioritySemaphore = make(chan struct{}, config.MaxConcurrency)
+			}
+			if config.IMSIPattern != "" {
+				var err error
+				priorityRegex, err = regexp.Compile(config.IMSIPattern)
+				if err != nil {
+					logger.GmmLog.Errorf("Invalid PriorityUE IMSI Pattern: %v", err)
+				}
+			}
+		})
+
+		isPriority := false
+		if priorityRegex != nil {
+			isPriority = priorityRegex.MatchString(targetID)
+		}
+
+		if isPriority {
+			ue.GmmLog.Infof("Priority UE detected: %s", targetID)
+		} else {
+			if nonPrioritySemaphore != nil {
+				select {
+				case nonPrioritySemaphore <- struct{}{}:
+					ue.GmmLog.Infof("Non-priority UE admitted: %s", targetID)
+					defer func() { <-nonPrioritySemaphore }()
+				default:
+					ue.GmmLog.Warnf("Congestion: Rejecting Non-priority UE %s", targetID)
+					return fmt.Errorf("congestion control: max concurrency reached")
+				}
+			}
+		}
 	}
 
 	// NgKsi: TS 24.501 9.11.3.32
